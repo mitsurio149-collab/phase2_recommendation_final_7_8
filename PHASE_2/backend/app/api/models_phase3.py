@@ -1,0 +1,405 @@
+"""API models for Phase 3 (Forecasting)
+"""
+from pydantic import BaseModel, Field
+from datetime import datetime
+from typing import Optional, List, Dict, Any
+from enum import Enum
+
+
+class ForecastDelayBreakdown(BaseModel):
+    """
+    Additive decomposition of `expected_delay_days`.
+
+    All components use the same `projected_velocity` basis as the forecast,
+    so these fields sum exactly to `expected_delay_days`.
+
+    expected_delay_days = days_elapsed + remaining_days_total - planned_window_days
+    where remaining_days_total = adjusted_remaining / projected_velocity * sprint_days
+    """
+
+    planned_window_days: float = Field(
+        ...,
+        description="Planned project duration in days (target_end_date - project_start)",
+    )
+    days_elapsed: float = Field(
+        ..., description="Schedule days already consumed by completed and in-progress sprints"
+    )
+    remaining_days_total: float = Field(
+        ..., description="Forecasted remaining days = adjusted_remaining / projected_velocity * sprint_days"
+    )
+    # Additive breakdown of remaining_days_total
+    remaining_days_base_work: float = Field(
+        ..., description="Portion of remaining_days driven by raw remaining effort at projected velocity"
+    )
+    remaining_days_spillover: float = Field(
+        ..., description="Portion of remaining_days driven by spillover penalty hours at projected velocity"
+    )
+    remaining_days_blocker_loss: float = Field(
+        ...,
+        description=(
+            "Extra days caused by blocker-reduced velocity: equivalent days compared against base velocity"
+        ),
+    )
+    expected_delay_days: float = Field(
+        ...,
+        description=(
+            "Days late vs target (mirrors ForecastResult.expected_delay_days). "
+            "= days_elapsed + remaining_days_total - planned_window_days"
+        ),
+    )
+
+
+class ForecastScheduleDiagnostics(BaseModel):
+    """
+    Diagnostic schedule components computed using `base_velocity` (not `projected_velocity`).
+    These are driver magnitudes for human explanation and are NOT additive to
+    `expected_delay_days`.
+    """
+
+    is_additive: bool = Field(
+        False,
+        description="Always False — these are diagnostic values, not an additive decomposition",
+    )
+    base_schedule_days: float = Field(
+        ..., description="Days to complete raw remaining effort at base (unpenalised) velocity"
+    )
+    spillover_days: float = Field(..., description="Extra days from spillover penalty at base velocity")
+    blocker_days: float = Field(..., description="Extra days from blocker velocity loss (projected vs base)")
+    critical_path_days: float = Field(..., description="Extra days from critical path serialisation beyond remaining effort")
+    diagnostic_total_days: float = Field(..., description="Sum of above components (does not equal expected_delay_days)")
+
+
+class ForecastEffortBreakdown(BaseModel):
+    """Explainable breakdown of forecast effort components."""
+
+    raw_remaining_effort_hours: float = Field(..., description="Remaining effort without spillover or critical path uplift")
+    critical_path_remaining_hours: float = Field(..., description="Remaining critical path effort used by the forecast")
+    spillover_penalty_hours: float = Field(..., description="Additional effort from predicted spillover items")
+    blocker_penalty_hours: float = Field(..., description="Effective velocity penalty converted to equivalent effort hours")
+    forecast_adjusted_effort_hours: float = Field(..., description="Total adjusted effort used by the forecast")
+
+
+class ForecastResult(BaseModel):
+    """Deterministic single-point forecast result."""
+
+    target_end_date: datetime = Field(..., description="Project target completion date")
+    expected_finish_date: datetime = Field(..., description="Forecasted project completion date")
+    expected_delay_days: float = Field(..., description="Days between expected finish and target end date (negative = early, positive = late)")
+    remaining_effort_hours: float = Field(..., description="Remaining work to complete (hours)")
+    completion_percentage: float = Field(..., ge=0.0, le=1.0, description="Project completion percentage (0.0-1.0)")
+    projected_velocity: float = Field(..., description="Projected velocity in hours per sprint")
+    on_track: bool = Field(..., description="True if expected_finish_date <= target_end_date, false otherwise")
+    raw_remaining_effort_hours: float = Field(..., description="Remaining effort before forecast adjustments")
+    critical_path_remaining_hours: float = Field(..., description="Remaining critical-path effort used by the forecast")
+    spillover_penalty_hours: float = Field(..., description="Additional hours added by predicted spillover")
+    blocker_penalty_hours: float = Field(..., description="Velocity penalty hours due to blockers")
+    forecast_adjusted_effort_hours: float = Field(..., description="Adjusted effort used for the forecast calculation")
+    delay_breakdown: ForecastDelayBreakdown = Field(
+        ...,
+        description=(
+            "Additive decomposition of expected_delay_days. "
+            "days_elapsed + remaining_days_total - planned_window_days == expected_delay_days"
+        ),
+    )
+    schedule_diagnostics: ForecastScheduleDiagnostics = Field(
+        ...,
+        description=(
+            "Diagnostic driver magnitudes computed at base velocity. "
+            "Not additive — use delay_breakdown for the exact decomposition."
+        ),
+    )
+    effort_breakdown: ForecastEffortBreakdown = Field(..., description="Structured breakdown of forecast effort components")
+    forecast_vs_montecarlo_note: str = Field(
+        ...,
+        description=(
+            "Explains why the deterministic delay and Monte Carlo "
+            "on-time probability can appear contradictory"
+        ),
+    )
+
+
+class ForecastResponse(BaseModel):
+    session_id: str
+    project_name: str
+    forecast: ForecastResult
+
+
+class OnTimeRisk(str, Enum):
+    """Risk level based on on-time delivery probability."""
+    LOW = "LOW"              # >80% probability of on-time delivery
+    MEDIUM = "MEDIUM"        # 60-79% probability
+    HIGH = "HIGH"            # 40-59% probability
+    CRITICAL = "CRITICAL"    # <40% probability
+
+
+class MonteCarloStatistics(BaseModel):
+    """Statistical distribution of simulation results."""
+
+    mean_finish_date: datetime = Field(..., description="Mean expected finish date across all simulations")
+    median_finish_date: datetime = Field(..., description="Median expected finish date")
+    percentile_10: datetime = Field(..., description="10th percentile (optimistic scenario)")
+    percentile_25: datetime = Field(..., description="25th percentile")
+    percentile_50: datetime = Field(..., description="50th percentile (median)")
+    percentile_75: datetime = Field(..., description="75th percentile")
+    percentile_80: datetime = Field(..., description="80th percentile (for analysis)")
+    percentile_90: datetime = Field(..., description="90th percentile (pessimistic scenario)")
+    percentile_95: datetime = Field(..., description="95th percentile (extreme pessimistic)")
+    
+    mean_delay_days: float = Field(..., description="Mean delay vs. target end date (days)")
+    median_delay_days: float = Field(..., description="Median delay vs. target end date (days)")
+
+
+class MonteCarloResult(BaseModel):
+    """Monte Carlo simulation result with probability distribution."""
+
+    target_end_date: datetime = Field(..., description="Project target completion date (constant across all simulations)")
+    simulation_count: int = Field(..., description="Number of simulations performed", ge=1)
+    
+    # Statistics
+    statistics: MonteCarloStatistics
+    
+    # On-time delivery probability
+    on_time_probability: float = Field(..., description="Probability of finishing on or before target_end_date (0.0-1.0)", ge=0.0, le=1.0)
+    on_time_risk_level: OnTimeRisk = Field(..., description="Risk rating: LOW (>80%), MEDIUM (60-79%), HIGH (40-59%), CRITICAL (<40%)")
+    
+    # Counts
+    simulations_on_time: int = Field(..., description="Number of simulations finishing on or before target_end_date")
+    simulations_late: int = Field(..., description="Number of simulations finishing after target_end_date")
+    
+    # Additional context
+    most_likely_finish_date: datetime = Field(..., description="Median finish date (most likely outcome)")
+    best_case_finish_date: datetime = Field(..., description="10th percentile (best case)")
+    p80_finish_date: datetime = Field(..., description="80th percentile (80% of outcomes complete by this date)")
+    p95_finish_date: datetime = Field(..., description="95th percentile (95% of outcomes complete by this date)")
+    worst_case_finish_date: datetime = Field(..., description="90th percentile (worst case)")
+
+
+class MonteCarloResponse(BaseModel):
+    """API response for Monte Carlo analysis."""
+    session_id: str
+    project_name: str
+    monte_carlo: MonteCarloResult
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# PHASE 3.3 RISK ENGINE MODELS
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class RiskLevel(str, Enum):
+    """Risk level classification (0-100 scale)."""
+    LOW = "LOW"              # 0-20
+    MODERATE = "MODERATE"    # 21-40
+    HIGH = "HIGH"            # 41-60
+    VERY_HIGH = "VERY_HIGH"  # 61-80
+    CRITICAL = "CRITICAL"    # 81-100
+
+
+class RiskDriver(BaseModel):
+    """Single risk driver with explanation."""
+    
+    category: str = Field(
+        ...,
+        description="Risk category: SCHEDULE, DEPENDENCY, RESOURCE, SCOPE, or BLOCKER"
+    )
+    score: float = Field(
+        ...,
+        ge=0.0,
+        le=100.0,
+        description="Risk contribution score (0-100)"
+    )
+    title: str = Field(..., description="Short title for risk driver")
+    description: str = Field(..., description="Detailed explanation of the risk")
+    recommendation_hint: str = Field(
+        ...,
+        description="Actionable recommendation to mitigate this risk"
+    )
+
+
+class SprintRisk(BaseModel):
+    """Risk analysis at sprint level."""
+    
+    sprint_id: int = Field(..., description="Sprint number")
+    risk_score: float = Field(
+        ...,
+        ge=0.0,
+        le=100.0,
+        description="Sprint-level risk score (0-100)"
+    )
+    risk_level: RiskLevel = Field(..., description="Risk level classification")
+    blocked_items: int = Field(..., ge=0, description="Number of blocked items in sprint")
+    spillover_items: int = Field(..., ge=0, description="Predicted spillover items from sprint")
+    overload_pct: float = Field(
+        ...,
+        ge=0.0,
+        le=300.0,
+        description="Sprint overload percentage (planned effort / capacity)"
+    )
+    dependency_count: int = Field(..., ge=0, description="Number of dependencies in sprint")
+
+
+class RiskExplanation(BaseModel):
+    """Explainable breakdown of a risk score."""
+    
+    score: float = Field(..., ge=0.0, le=100.0, description="Risk score")
+    reasons: List[str] = Field(default_factory=list, description="Human-readable reasons for the score")
+    drivers: List[RiskDriver] = Field(
+        default_factory=list,
+        description="Contributing risk drivers"
+    )
+
+
+class RiskResult(BaseModel):
+    """Comprehensive risk analysis result."""
+    
+    # Overall project risk
+    overall_risk_score: float = Field(
+        ...,
+        ge=0.0,
+        le=100.0,
+        description="Overall project risk score (0-100)"
+    )
+    overall_risk_level: RiskLevel = Field(..., description="Overall risk classification")
+    
+    # Sub-score explanations
+    schedule_risk: RiskExplanation = Field(
+        ...,
+        description="Schedule risk breakdown with reasons"
+    )
+    dependency_risk: RiskExplanation = Field(
+        ...,
+        description="Dependency risk breakdown with reasons"
+    )
+    resource_risk: RiskExplanation = Field(
+        ...,
+        description="Resource risk breakdown with reasons"
+    )
+    scope_risk: RiskExplanation = Field(
+        ...,
+        description="Scope risk breakdown with reasons"
+    )
+    
+    # Top risk drivers
+    top_risk_drivers: List[RiskDriver] = Field(
+        max_items=10,
+        description="Top 10 risk drivers, sorted by risk contribution (descending)"
+    )
+    
+    # Sprint-level analysis
+    sprint_risks: List[SprintRisk] = Field(
+        default_factory=list,
+        description="Per-sprint risk analysis"
+    )
+    
+    # Scoring formula documentation
+    weighting_formula: str = Field(
+        default="overall = 0.40 * schedule + 0.25 * dependency + 0.20 * resource + 0.15 * scope",
+        description="Weighted aggregation formula used to calculate overall_risk_score"
+    )
+    risk_vs_montecarlo_note: str = Field(
+        default="",
+        description=(
+            "Explains why overall risk level and Monte Carlo "
+            "on-time probability can appear contradictory"
+        ),
+    )
+
+
+class RiskResponse(BaseModel):
+    """API response for risk analysis."""
+    
+    session_id: str = Field(..., description="Session ID")
+    project_name: str = Field(..., description="Project name")
+    risk_analysis: RiskResult = Field(..., description="Risk analysis result")
+
+
+class RecommendationType(str, Enum):
+    RESOLVE_BLOCKER = "Resolve Blocker"
+    ADD_RESOURCE = "Add Resource"
+    REASSIGN_WORK = "Reassign Work"
+    REDUCE_ITEM_SCOPE = "Reduce Item Scope"
+    PARALLELIZE_TASKS = "Parallelize Tasks"
+    MOVE_BLOCKER_ITEMS = "Move Blocked Items Forward"
+    SPLIT_TASK = "Split Task"
+    CRITICAL_PATH_OPTIMIZATION = "Critical Path Optimization"
+
+
+class RecommendationSummary(BaseModel):
+    recommendation_id: str = Field(..., description="Unique recommendation identifier")
+    type: RecommendationType = Field(..., description="Recommendation type")
+    action: str = Field(..., description="Action text for the recommendation")
+    target_ids: List[str] = Field(default_factory=list, description="Target entity IDs")
+    details: Dict[str, Any] = Field(default_factory=dict, description="Structured recommendation details")
+    reason: str = Field(..., description="Why this recommendation was generated")
+    implementation_effort: str = Field(..., description="Estimated implementation effort")
+    confidence: str = Field(..., description="Confidence level")
+    priority_score: float = Field(..., ge=0.0, le=100.0, description="Recommendation effectiveness score")
+    baseline_probability: float = Field(..., ge=0.0, le=1.0, description="Baseline on-time probability")
+    after_probability: float = Field(..., ge=0.0, le=1.0, description="On-time probability after applying recommendation")
+    expected_probability_gain: float = Field(..., description="Probability gain from recommendation")
+    baseline_delay_days: float = Field(..., description="Baseline expected delay in days")
+    after_delay_days: float = Field(..., description="Expected delay after recommendation")
+    expected_delay_gain_days: float = Field(..., description="Delay reduction in days")
+    baseline_risk_score: float = Field(..., description="Baseline overall risk score")
+    after_risk_score: float = Field(..., description="Overall risk score after recommendation")
+    expected_risk_reduction: float = Field(..., description="Risk score reduction")
+
+
+class RecommendationResult(BaseModel):
+    session_id: str = Field(..., description="Session ID")
+    project_name: str = Field(..., description="Project name")
+    baseline_probability: float = Field(..., ge=0.0, le=1.0, description="Baseline on-time probability")
+    baseline_delay_days: float = Field(..., description="Baseline expected delay")
+    baseline_risk_score: float = Field(..., description="Baseline overall risk score")
+    recommendations: List[RecommendationSummary] = Field(default_factory=list, description="Ranked recommendations")
+
+
+class RecommendationSimulationRequest(BaseModel):
+    recommendation_id: str = Field(..., description="Recommendation ID to simulate")
+
+
+class RecommendationScenarioRequest(BaseModel):
+    recommendation_ids: List[str] = Field(..., description="List of recommendation IDs to simulate as a scenario")
+
+
+class ScopeChangeRequest(BaseModel):
+    item_ids: List[str] = Field(..., min_items=1, description="Work item IDs to descoped")
+    reason: Optional[str] = Field(None, description="Reason for the scope change")
+
+
+class RecommendationSimulationResult(BaseModel):
+    session_id: str = Field(..., description="Session ID")
+    project_name: str = Field(..., description="Project name")
+    recommendation_id: Optional[str] = Field(None, description="Recommendation ID if single recommendation simulated")
+    baseline_probability: float = Field(..., ge=0.0, le=1.0)
+    after_probability: float = Field(..., ge=0.0, le=1.0)
+    probability_gain: float = Field(..., description="Gain in on-time probability")
+    baseline_delay_days: float = Field(..., description="Baseline delay days")
+    after_delay_days: float = Field(..., description="Delay days after simulation")
+    delay_reduction_days: float = Field(..., description="Delay reduction in days")
+    baseline_risk_score: float = Field(..., description="Baseline overall risk score")
+    after_risk_score: float = Field(..., description="Overall risk score after simulation")
+    risk_reduction: float = Field(..., description="Risk score reduction")
+    scenario_recommendation_ids: Optional[List[str]] = Field(None, description="List of recommendation IDs simulated")
+
+
+class RecommendationResponse(BaseModel):
+    session_id: str = Field(..., description="Session ID")
+    project_name: str = Field(..., description="Project name")
+    recommendations: List[RecommendationSummary] = Field(default_factory=list, description="Ranked recommendation list")
+
+
+class RecommendationSimulationResponse(BaseModel):
+    session_id: str = Field(..., description="Session ID")
+    project_name: str = Field(..., description="Project name")
+    simulation_result: RecommendationSimulationResult = Field(..., description="Simulation result")
+
+
+class ScopeChangeResponse(BaseModel):
+    session_id: str = Field(..., description="Session ID")
+    project_name: str = Field(..., description="Project name")
+    descoped_item_ids: List[str] = Field(default_factory=list, description="Work items removed from scope")
+    changed_item_count: int = Field(..., ge=0, description="Number of work items updated")
+    updated_remaining_effort_hours: float = Field(..., ge=0.0, description="Remaining effort after scope change")
+    forecast: ForecastResult = Field(..., description="Updated deterministic forecast")
+    risk_analysis: RiskResult = Field(..., description="Updated risk analysis")
