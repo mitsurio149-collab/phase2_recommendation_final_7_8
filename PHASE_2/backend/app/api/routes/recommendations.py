@@ -14,21 +14,51 @@ from app.api.models_phase3 import (
     RecommendationScenarioRequest,
     RecommendationSimulationResponse,
     RecommendationSimulationResult,
+    RecommendationSummary,
 )
-from app.engines.metrics_engine import MetricsEngine
-from app.engines.dependency_engine import DependencyGraphEngine
-from app.engines.critical_path_engine import CriticalPathEngine
-from app.engines.spillover_engine import SpilloverAnalysisEngine
-from app.engines.forecast_engine import ForecastEngine
-from app.engines.monte_carlo_engine import MonteCarloEngine
-from app.engines.impact_scoring_engine import ImpactScoringEngine
-from app.engines.risk_engine import RiskEngine
-from app.engines.recommendation_engine import RecommendationEngine
+from app.engines.recommendations.recommendation_engine_v2 import RecommendationEngineV2
+from app.engines.recommendations.models import ScoringWeights
 
 router = APIRouter(prefix="/api", tags=["Phase3.4"])
 
 
-def _build_engines(session_id: str):
+def _recommendation_to_summary(rec) -> RecommendationSummary:
+    return RecommendationSummary(
+        recommendation_id=rec.recommendation_id,
+        type=rec.action_type.value,
+        action=rec.title,
+        target_ids=rec.affected_item_ids + rec.affected_resource_ids + rec.affected_sprint_ids + rec.affected_blocker_ids,
+        details={
+            "affected_item_ids": rec.affected_item_ids,
+            "affected_resource_ids": rec.affected_resource_ids,
+            "affected_sprint_ids": rec.affected_sprint_ids,
+            "affected_blocker_ids": rec.affected_blocker_ids,
+            "metadata": rec.metadata,
+        },
+        reason=rec.description,
+        implementation_effort="Medium",
+        confidence=rec.confidence.value,
+        priority_score=round(rec.priority_score * 100.0, 2),
+        baseline_probability=0.0,
+        after_probability=0.0,
+        expected_probability_gain=0.0,
+        baseline_delay_days=0.0,
+        after_delay_days=0.0,
+        expected_delay_gain_days=rec.estimated_delay_reduction_days,
+        baseline_risk_score=0.0,
+        after_risk_score=0.0,
+        expected_risk_reduction=rec.estimated_risk_reduction,
+        impact_level="Medium",
+        impact_confidence=rec.confidence.value,
+        impact_classification="Positive Impact" if rec.estimated_delay_reduction_days > 0.0 else "Negligible Impact",
+        business_impact=rec.description,
+        impact_summary=rec.description,
+        category=None,
+        recommended_actions=[rec.title],
+    )
+
+
+def _build_engine(session_id: str) -> RecommendationEngineV2:
     project_state = store.get_project_state(session_id)
     if not project_state:
         raise HTTPException(
@@ -39,33 +69,7 @@ def _build_engines(session_id: str):
                 message=f"Session {session_id} not found",
             ).model_dump(),
         )
-
-    metrics = MetricsEngine(project_state).calculate()
-    dep_engine = DependencyGraphEngine(project_state)
-    dag = dep_engine.build_dag()
-    cp_result = CriticalPathEngine(project_state, dag).analyze()
-    spillover = SpilloverAnalysisEngine(project_state, metrics.average_item_effort).analyze()
-    forecast = ForecastEngine(project_state, metrics, cp_result, spillover).calculate()
-    monte_carlo = MonteCarloEngine(
-        project_state=project_state,
-        metrics=metrics,
-        cp_result=cp_result,
-        spillover=spillover,
-        simulation_count=1000,
-    ).calculate()
-    impact_scores = ImpactScoringEngine(project_state, dag).score()
-    risk_result = RiskEngine(
-        project_state=project_state,
-        metrics=metrics,
-        cp_result=cp_result,
-        dag=dag,
-        spillover=spillover,
-        forecast=forecast,
-        monte_carlo=monte_carlo,
-        impact_scores=impact_scores,
-    ).analyze()
-
-    return project_state, metrics, dag, cp_result, spillover, forecast, monte_carlo, risk_result
+    return RecommendationEngineV2(project_state=project_state, simulation_count=1000, scoring_weights=ScoringWeights())
 
 
 @router.get("/recommendations")
@@ -75,23 +79,12 @@ async def get_recommendations(
 ):
     try:
         session_id = session_id.strip()
-        project_state, metrics, dag, cp_result, spillover, forecast, monte_carlo, risk_result = _build_engines(session_id)
-
-        recommendation_engine = RecommendationEngine(
-            project_state=project_state,
-            metrics=metrics,
-            cp_result=cp_result,
-            dag=dag,
-            spillover=spillover,
-            forecast=forecast,
-            monte_carlo=monte_carlo,
-            risk_result=risk_result,
-        )
-        candidates = recommendation_engine.generate_recommendations()[:top_n]
+        recommendation_engine = _build_engine(session_id)
+        candidates = recommendation_engine.generate(top_n=top_n)
         response = RecommendationResponse(
             session_id=session_id,
-            project_name=project_state.project_info.project_name,
-            recommendations=[candidate.to_dict() for candidate in candidates],
+            project_name=recommendation_engine.project_state.project_info.project_name,
+            recommendations=[_recommendation_to_summary(rec) for rec in candidates],
         )
         return ApiResponse(success=True, data=response.model_dump(), message="Recommendations generated")
     except HTTPException:
@@ -113,36 +106,25 @@ async def simulate_recommendation(
     request: RecommendationSimulationRequest = ..., 
 ):
     try:
-        project_state, metrics, dag, cp_result, spillover, forecast, monte_carlo, risk_result = _build_engines(session_id)
-
-        recommendation_engine = RecommendationEngine(
-            project_state=project_state,
-            metrics=metrics,
-            cp_result=cp_result,
-            dag=dag,
-            spillover=spillover,
-            forecast=forecast,
-            monte_carlo=monte_carlo,
-            risk_result=risk_result,
-        )
-        candidate = recommendation_engine.simulate_recommendation(request.recommendation_id)
+        recommendation_engine = _build_engine(session_id)
+        simulation_result = recommendation_engine.simulate(request.recommendation_id)
         response = RecommendationSimulationResponse(
             session_id=session_id,
-            project_name=project_state.project_info.project_name,
+            project_name=recommendation_engine.project_state.project_info.project_name,
             simulation_result=RecommendationSimulationResult(
                 session_id=session_id,
-                project_name=project_state.project_info.project_name,
-                recommendation_id=candidate.recommendation_id,
-                baseline_probability=candidate.baseline_probability,
-                after_probability=candidate.after_probability,
-                probability_gain=candidate.expected_probability_gain,
-                baseline_delay_days=candidate.baseline_delay_days,
-                after_delay_days=candidate.after_delay_days,
-                delay_reduction_days=candidate.expected_delay_gain_days,
-                baseline_risk_score=candidate.baseline_risk_score,
-                after_risk_score=candidate.after_risk_score,
-                risk_reduction=candidate.expected_risk_reduction,
-                scenario_recommendation_ids=[candidate.recommendation_id],
+                project_name=recommendation_engine.project_state.project_info.project_name,
+                recommendation_id=simulation_result.recommendation_ids[0] if simulation_result.recommendation_ids else None,
+                baseline_probability=simulation_result.baseline_metrics.on_time_probability,
+                after_probability=simulation_result.simulated_metrics.on_time_probability,
+                probability_gain=simulation_result.delta_on_time_probability,
+                baseline_delay_days=simulation_result.baseline_metrics.expected_delay_days,
+                after_delay_days=simulation_result.simulated_metrics.expected_delay_days,
+                delay_reduction_days=simulation_result.delta_expected_delay_days,
+                baseline_risk_score=simulation_result.baseline_metrics.overall_risk_score,
+                after_risk_score=simulation_result.simulated_metrics.overall_risk_score,
+                risk_reduction=simulation_result.delta_risk_score,
+                scenario_recommendation_ids=simulation_result.recommendation_ids,
             ),
         )
         return ApiResponse(success=True, data=response.model_dump(), message="Simulation completed")
@@ -165,35 +147,24 @@ async def simulate_scenario(
     request: RecommendationScenarioRequest = ..., 
 ):
     try:
-        project_state, metrics, dag, cp_result, spillover, forecast, monte_carlo, risk_result = _build_engines(session_id)
-
-        recommendation_engine = RecommendationEngine(
-            project_state=project_state,
-            metrics=metrics,
-            cp_result=cp_result,
-            dag=dag,
-            spillover=spillover,
-            forecast=forecast,
-            monte_carlo=monte_carlo,
-            risk_result=risk_result,
-        )
+        recommendation_engine = _build_engine(session_id)
         scenario = recommendation_engine.simulate_scenario(request.recommendation_ids)
         response = RecommendationSimulationResponse(
             session_id=session_id,
-            project_name=project_state.project_info.project_name,
+            project_name=recommendation_engine.project_state.project_info.project_name,
             simulation_result=RecommendationSimulationResult(
                 session_id=session_id,
-                project_name=project_state.project_info.project_name,
+                project_name=recommendation_engine.project_state.project_info.project_name,
                 recommendation_id=None,
-                baseline_probability=scenario["baseline"]["probability"],
-                after_probability=scenario["scenario"]["probability"],
-                probability_gain=scenario["probability_gain"],
-                baseline_delay_days=scenario["baseline"]["delay_days"],
-                after_delay_days=scenario["scenario"]["delay_days"],
-                delay_reduction_days=scenario["delay_reduction"],
-                baseline_risk_score=scenario["baseline"]["risk_score"],
-                after_risk_score=scenario["scenario"]["risk_score"],
-                risk_reduction=scenario["risk_reduction"],
+                baseline_probability=scenario.baseline_metrics.on_time_probability,
+                after_probability=scenario.simulated_metrics.on_time_probability,
+                probability_gain=scenario.delta_on_time_probability,
+                baseline_delay_days=scenario.baseline_metrics.expected_delay_days,
+                after_delay_days=scenario.simulated_metrics.expected_delay_days,
+                delay_reduction_days=scenario.delta_expected_delay_days,
+                baseline_risk_score=scenario.baseline_metrics.overall_risk_score,
+                after_risk_score=scenario.simulated_metrics.overall_risk_score,
+                risk_reduction=scenario.delta_risk_score,
                 scenario_recommendation_ids=request.recommendation_ids,
             ),
         )

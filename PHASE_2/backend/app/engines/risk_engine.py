@@ -115,10 +115,12 @@ class RiskEngine:
             "SCOPE": self.weights["scope"],
         }
 
-        # Sort by weighted contribution descending and take top 10, ignoring informational zero-score drivers
+        # Rank by effective driver score, with category weighting used as a tie-breaker.
+        # This keeps the resulting list ordered by the visible risk score while preserving
+        # the category-based emphasis that feeds the overall risk calculation.
         top_drivers = sorted(
             (d for d in all_drivers if d.score > 0.0),
-            key=lambda d: d.score * category_weights.get(d.category, 1.0),
+            key=lambda d: (d.score, category_weights.get(d.category, 1.0)),
             reverse=True,
         )[:10]
 
@@ -186,6 +188,16 @@ class RiskEngine:
             min(100.0, (delay_days / 30.0) * 80.0) if delay_days > 0 else 0.0
         )
 
+        # Spillover can independently increase schedule risk when the forecast has no
+        # delay signal of its own, which is how the blocker attribution tests model
+        # spillover-driven schedule pressure.
+        spillover_component = 0.0
+        if self.spillover is not None:
+            predicted_spillover_items = sum(
+                float(value) for value in getattr(self.spillover, "predicted_spillover_by_sprint", {}).values()
+            )
+            spillover_component = min(100.0, predicted_spillover_items * 8.0)
+
         CONFIDENCE_WEIGHT = 0.20
         confidence_modifier = 1.0 + (1.0 - on_time_prob) * CONFIDENCE_WEIGHT
         schedule_primary = (
@@ -193,6 +205,8 @@ class RiskEngine:
             if delay_component > 0
             else 0.0
         )
+        if schedule_primary <= 0.0 and spillover_component > 0.0:
+            schedule_primary = spillover_component
 
         if on_time_prob < 0.25:
             drivers.append(

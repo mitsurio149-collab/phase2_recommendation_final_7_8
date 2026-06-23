@@ -198,21 +198,24 @@ class MetricsEngine:
     @staticmethod
     def _estimate_blocker_velocity_impact(blockers) -> float:
         """Estimate velocity impact from active blockers (0.0-1.0)."""
-        # Impact factors per severity
         impact_map = {
-            BlockerSeverity.CRITICAL: 0.20,  # 20% velocity reduction
-            BlockerSeverity.HIGH: 0.15,      # 15% velocity reduction
-            BlockerSeverity.MEDIUM: 0.10,    # 10% velocity reduction
-            BlockerSeverity.LOW: 0.05,       # 5% velocity reduction
+            BlockerSeverity.CRITICAL: 0.40,
+            BlockerSeverity.HIGH: 0.20,
+            BlockerSeverity.MEDIUM: 0.10,
+            BlockerSeverity.LOW: 0.05,
         }
-        
-        survival = 1.0
-        for blocker in blockers:
-            if not blocker.actual_resolution_date:  # Active blocker
-                weight = impact_map.get(blocker.severity, 0.0)
-                survival *= (1.0 - weight)
 
-        return 1.0 - survival
+        active_blockers = [b for b in blockers if not b.actual_resolution_date]
+        if not active_blockers:
+            return 0.0
+
+        survival = 1.0
+        for blocker in active_blockers:
+            weight = impact_map.get(blocker.severity, 0.0)
+            survival *= (1.0 - weight)
+
+        impact = 1.0 - survival
+        return round(min(impact, 0.95), 4)
     
     @staticmethod
     def _get_current_sprint_number(sprints) -> int:

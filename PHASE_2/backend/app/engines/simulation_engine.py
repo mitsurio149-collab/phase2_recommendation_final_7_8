@@ -135,7 +135,7 @@ class SimulationEngine:
             cp_result=cp_result,
             spillover=spillover,
             simulation_count=self.simulation_count,
-            seed=self.seed,
+            seed=42 if self.seed is None else self.seed,
         ).calculate()
         impact_scores = ImpactScoringEngine(clone, dag).score()
         risk_result = RiskEngine(

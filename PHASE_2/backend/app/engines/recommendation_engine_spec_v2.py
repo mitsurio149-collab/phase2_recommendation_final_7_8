@@ -457,11 +457,12 @@ class SignalDetectionEngine:
         ]
         
         # Near critical
+        slack_map = getattr(self.cp_result, "item_slack_map", {}) or {}
         near_critical_hours = self.project_state.project_info.sprint_duration_days * 0.25 * 8
         near_critical = [
-            item_id for item_id in self.project_state.work_items
-            if item_id not in cp_nodes
-            and (self.cp_result.slack_map.get(item_id, 0) < near_critical_hours)
+            item.item_id for item in self.project_state.work_items
+            if item.item_id not in cp_nodes
+            and (slack_map.get(item.item_id, 0) < near_critical_hours)
         ]
         
         # Flag

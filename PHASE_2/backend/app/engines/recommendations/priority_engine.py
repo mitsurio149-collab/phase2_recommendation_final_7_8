@@ -1,0 +1,76 @@
+from __future__ import annotations
+
+from typing import Dict, List, Optional
+
+from app.engines.recommendations.models import (
+    ImpactEstimate,
+    Recommendation,
+    RecommendationAction,
+    RecommendationCandidate,
+    ScoringWeights,
+    UpstreamEngineOutputs,
+    ConfidenceLevel,
+)
+
+
+class PriorityEngine:
+    def __init__(self, upstream: UpstreamEngineOutputs, weights: Optional[ScoringWeights] = None) -> None:
+        self.upstream = upstream
+        self.weights = weights or ScoringWeights()
+
+    def score_and_rank(
+        self,
+        candidates: List[RecommendationCandidate],
+        impact_estimates: Dict[str, ImpactEstimate],
+    ) -> List[Recommendation]:
+        ranked: List[Recommendation] = []
+        for candidate in candidates:
+            impact = impact_estimates.get(candidate.recommendation_id)
+            if impact is None:
+                continue
+            priority_score = self._score(candidate, impact)
+            priority_score = max(0.0, min(1.0, priority_score))
+            ranked.append(
+                Recommendation(
+                    recommendation_id=candidate.recommendation_id,
+                    title=candidate.title,
+                    description=candidate.description,
+                    action_type=candidate.action_type,
+                    priority_score=priority_score,
+                    confidence=impact.confidence,
+                    estimated_hours_recovered=impact.estimated_hours_recovered,
+                    estimated_delay_reduction_days=impact.estimated_delay_reduction_days,
+                    estimated_risk_reduction=impact.estimated_risk_reduction,
+                    affected_item_ids=candidate.affected_item_ids,
+                    affected_resource_ids=candidate.affected_resource_ids,
+                    affected_sprint_ids=candidate.affected_sprint_ids,
+                    affected_blocker_ids=candidate.affected_blocker_ids,
+                    root_cause_signal_id=candidate.root_cause_signal_id,
+                    supporting_signal_ids=candidate.supporting_signal_ids,
+                    impact_evidence=impact.evidence,
+                    metadata={
+                        "simulation_params": candidate.simulation_params,
+                        "feasibility_checks": candidate.feasibility_checks,
+                    },
+                )
+            )
+
+        ranked.sort(key=lambda item: (-item.priority_score, item.recommendation_id))
+        return ranked
+
+    def _score(self, candidate: RecommendationCandidate, impact: ImpactEstimate) -> float:
+        blocker_factor = 1.0 if RecommendationAction.RESOLVE_BLOCKER == candidate.action_type else 0.0
+        schedule_factor = 1.0 if impact.estimated_delay_reduction_days > 0.0 else 0.0
+        cp_factor = 1.0 if candidate.action_type in {RecommendationAction.ADVANCE_ITEM_TO_EARLIER_SPRINT, RecommendationAction.PARALLELIZE_ITEMS} else 0.0
+        capacity_factor = 1.0 if candidate.action_type in {RecommendationAction.REASSIGN_ITEM, RecommendationAction.ADD_RESOURCE_SKILL} else 0.0
+        risk_factor = min(1.0, impact.estimated_risk_reduction)
+        hours_factor = min(1.0, impact.estimated_hours_recovered / max(1.0, self.upstream.forecast.remaining_effort_hours))
+
+        return (
+            self.weights.w_risk * risk_factor
+            + self.weights.w_schedule * schedule_factor
+            + self.weights.w_blocker * blocker_factor
+            + self.weights.w_cp * cp_factor
+            + self.weights.w_capacity * capacity_factor
+            + 0.1 * hours_factor
+        )

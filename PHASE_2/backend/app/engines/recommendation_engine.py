@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import statistics
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -202,7 +203,6 @@ class RecommendationEngine:
         self.resources = {r.resource_id: r for r in project_state.team}
         self.blockers = [b for b in project_state.blockers if not b.actual_resolution_date]
         self.current_sprint = self._find_current_sprint()
-        self.recommendation_counter = 0
         self.baseline_metrics = self._baseline_summary()
         self._cached_candidates: List[RecommendationCandidate] = []
 
@@ -296,7 +296,7 @@ class RecommendationEngine:
             )
             candidates.append(
                 RecommendationCandidate(
-                    recommendation_id=self._next_id(),
+                    recommendation_id=self._stable_id(RecommendationType.RESOLVE_BLOCKER, target_ids),
                     type=RecommendationType.RESOLVE_BLOCKER,
                     action=action,
                     target_ids=target_ids,
@@ -346,7 +346,7 @@ class RecommendationEngine:
             )
             candidates.append(
                 RecommendationCandidate(
-                    recommendation_id=self._next_id(),
+                    recommendation_id=self._stable_id(RecommendationType.ADD_RESOURCE, []),
                     type=RecommendationType.ADD_RESOURCE,
                     action=action,
                     target_ids=[],
@@ -390,7 +390,7 @@ class RecommendationEngine:
             )
             candidates.append(
                 RecommendationCandidate(
-                    recommendation_id=self._next_id(),
+                    recommendation_id=self._stable_id(RecommendationType.REASSIGN_WORK, [item.item_id]),
                     type=RecommendationType.REASSIGN_WORK,
                     action=action,
                     target_ids=[item.item_id],
@@ -441,7 +441,7 @@ class RecommendationEngine:
             )
             candidates.append(
                 RecommendationCandidate(
-                    recommendation_id=self._next_id(),
+                    recommendation_id=self._stable_id(RecommendationType.REDUCE_ITEM_SCOPE, [item.item_id]),
                     type=RecommendationType.REDUCE_ITEM_SCOPE,
                     action=action,
                     target_ids=[item.item_id],
@@ -497,7 +497,7 @@ class RecommendationEngine:
             )
             candidates.append(
                 RecommendationCandidate(
-                    recommendation_id=self._next_id(),
+                    recommendation_id=self._stable_id(RecommendationType.PARALLELIZE_TASKS, [pred_item.item_id, succ_item.item_id]),
                     type=RecommendationType.PARALLELIZE_TASKS,
                     action=action,
                     target_ids=[pred_item.item_id, succ_item.item_id],
@@ -552,7 +552,7 @@ class RecommendationEngine:
         )
         candidates.append(
             RecommendationCandidate(
-                recommendation_id=self._next_id(),
+                recommendation_id=self._stable_id(RecommendationType.MOVE_BLOCKER_ITEMS, advanceable_items),
                 type=RecommendationType.MOVE_BLOCKER_ITEMS,
                 action=action,
                 target_ids=advanceable_items,
@@ -592,7 +592,7 @@ class RecommendationEngine:
             )
             candidates.append(
                 RecommendationCandidate(
-                    recommendation_id=self._next_id(),
+                    recommendation_id=self._stable_id(RecommendationType.SPLIT_TASK, [item.item_id]),
                     type=RecommendationType.SPLIT_TASK,
                     action=action,
                     target_ids=[item.item_id],
@@ -626,7 +626,7 @@ class RecommendationEngine:
         )
         return [
             RecommendationCandidate(
-                recommendation_id=self._next_id(),
+                recommendation_id=self._stable_id(RecommendationType.CRITICAL_PATH_OPTIMIZATION, [i.item_id for i in top_items]),
                 type=RecommendationType.CRITICAL_PATH_OPTIMIZATION,
                 action=action,
                 target_ids=[i.item_id for i in top_items],
@@ -715,6 +715,7 @@ class RecommendationEngine:
             cp_result=cp_result,
             spillover=spillover,
             simulation_count=self.simulation_count,
+            seed=42,
         ).calculate()
         impact_scores = ImpactScoringEngine(state, dag).score()
         risk_result = RiskEngine(
@@ -973,9 +974,9 @@ class RecommendationEngine:
     # ------------------------------------------------------------------
     # Utility and scoring
     # ------------------------------------------------------------------
-    def _next_id(self) -> str:
-        self.recommendation_counter += 1
-        return f"REC-{self.recommendation_counter:03d}"
+    def _stable_id(self, rec_type: RecommendationType, target_ids: List[str]) -> str:
+        key = f"{rec_type.value}::{':'.join(sorted(target_ids))}"
+        return "REC-" + hashlib.sha1(key.encode()).hexdigest()[:8].upper()
 
     def _find_current_sprint(self):
         for sprint in self.project_state.sprints:

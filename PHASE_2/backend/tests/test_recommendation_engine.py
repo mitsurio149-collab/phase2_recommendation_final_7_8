@@ -28,7 +28,7 @@ from app.engines.forecast_engine import ForecastEngine
 from app.engines.monte_carlo_engine import MonteCarloEngine
 from app.engines.impact_scoring_engine import ImpactScoringEngine
 from app.engines.risk_engine import RiskEngine
-from app.engines.recommendation_engine import RecommendationEngine
+from app.engines.recommendation_engine import RecommendationEngine, RecommendationCandidate
 from app.api.models_phase3 import RecommendationType
 
 
@@ -241,24 +241,23 @@ def recommendation_project_state():
     return make_recommendation_project_state()
 
 
-@pytest.fixture
-def recommendation_engine(recommendation_project_state):
-    metrics = MetricsEngine(recommendation_project_state).calculate()
-    dag = DependencyGraphEngine(recommendation_project_state).build_dag()
-    cp = CriticalPathEngine(recommendation_project_state, dag).analyze()
-    spill = SpilloverAnalysisEngine(recommendation_project_state, metrics.average_item_effort).analyze()
-    forecast = ForecastEngine(recommendation_project_state, metrics, cp, spill).calculate()
+def build_recommendation_engine(project_state):
+    metrics = MetricsEngine(project_state).calculate()
+    dag = DependencyGraphEngine(project_state).build_dag()
+    cp = CriticalPathEngine(project_state, dag).analyze()
+    spill = SpilloverAnalysisEngine(project_state, metrics.average_item_effort).analyze()
+    forecast = ForecastEngine(project_state, metrics, cp, spill).calculate()
     monte_carlo = MonteCarloEngine(
-        project_state=recommendation_project_state,
+        project_state=project_state,
         metrics=metrics,
         cp_result=cp,
         spillover=spill,
         simulation_count=50,
         seed=42,
     ).calculate()
-    impact_scores = ImpactScoringEngine(recommendation_project_state, dag).score()
+    impact_scores = ImpactScoringEngine(project_state, dag).score()
     risk_result = RiskEngine(
-        project_state=recommendation_project_state,
+        project_state=project_state,
         metrics=metrics,
         cp_result=cp,
         dag=dag,
@@ -268,7 +267,7 @@ def recommendation_engine(recommendation_project_state):
         impact_scores=impact_scores,
     ).analyze()
     return RecommendationEngine(
-        project_state=recommendation_project_state,
+        project_state=project_state,
         metrics=metrics,
         cp_result=cp,
         dag=dag,
@@ -278,6 +277,11 @@ def recommendation_engine(recommendation_project_state):
         risk_result=risk_result,
         simulation_count=50,
     )
+
+
+@pytest.fixture
+def recommendation_engine(recommendation_project_state):
+    return build_recommendation_engine(recommendation_project_state)
 
 
 def test_blocker_recommendations(recommendation_engine):
@@ -350,3 +354,63 @@ def test_simulate_scenario(recommendation_engine):
     assert scenario["scenario"]["probability"] >= 0.0
     assert scenario["scenario"]["delay_days"] == scenario["scenario"]["delay_days"]
     assert scenario["recommendation_ids"] == rec_ids
+
+
+def test_recommendation_ids_are_stable_across_calls(recommendation_engine):
+    first_pass = recommendation_engine.generate_recommendations()
+    second_pass = recommendation_engine.generate_recommendations()
+
+    assert [candidate.recommendation_id for candidate in first_pass] == [
+        candidate.recommendation_id for candidate in second_pass
+    ]
+
+
+def test_recommendation_ids_are_stable_across_engine_instances(recommendation_project_state):
+    first_engine = build_recommendation_engine(recommendation_project_state)
+    second_engine = build_recommendation_engine(recommendation_project_state)
+
+    first_pass = first_engine.generate_recommendations()
+    second_pass = second_engine.generate_recommendations()
+
+    assert [candidate.recommendation_id for candidate in first_pass] == [
+        candidate.recommendation_id for candidate in second_pass
+    ]
+
+
+def test_recommendation_id_changes_when_target_ids_change(recommendation_engine):
+    candidates = recommendation_engine.generate_recommendations()
+    candidate = next(c for c in candidates if c.target_ids)
+
+    changed_id = recommendation_engine._stable_id(candidate.type, ["DIFFERENT-ID"])
+
+    assert changed_id != candidate.recommendation_id
+
+
+def test_simulate_recommendation_is_deterministic(recommendation_engine):
+    candidates = recommendation_engine.generate_recommendations()
+    recommendation_id = candidates[0].recommendation_id
+
+    first_result = recommendation_engine.simulate_recommendation(recommendation_id)
+    second_result = recommendation_engine.simulate_recommendation(recommendation_id)
+
+    assert first_result.expected_probability_gain == pytest.approx(second_result.expected_probability_gain)
+
+
+def test_null_action_has_zero_probability_gain(recommendation_engine):
+    candidate = RecommendationCandidate(
+        recommendation_id="NULL-ACTION",
+        type=RecommendationType.RESOLVE_BLOCKER,
+        action="No-op",
+        target_ids=[],
+        details={},
+        reason="No-op",
+        implementation_effort="Low",
+        confidence="High",
+    )
+    candidate.baseline_probability = recommendation_engine.baseline_metrics["probability"]
+    candidate.baseline_delay_days = recommendation_engine.baseline_metrics["delay_days"]
+    candidate.baseline_risk_score = recommendation_engine.baseline_metrics["risk_score"]
+
+    recommendation_engine._simulate_candidate(candidate)
+
+    assert candidate.expected_probability_gain == pytest.approx(0.0, abs=1e-3)
